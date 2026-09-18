@@ -1,0 +1,160 @@
+name: Download public Instagram media
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install download tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade instaloader gallery-dl requests
+      - name: Fetch public media
+        shell: bash
+        run: |
+          set +e
+          mkdir -p raw selected
+          echo "=== Attempt 1: Instagram public web API ==="
+          python - <<'PY'
+          import os, requests
+          from pathlib import Path
+
+          out = Path("raw")
+          s = requests.Session()
+          s.headers.update({
+              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9",
+          })
+          try:
+              s.get("https://www.instagram.com/arcana_events/", timeout=20)
+              h = dict(s.headers)
+              h.update({
+                  "X-IG-App-ID": "936619743392459",
+                  "X-Requested-With": "XMLHttpRequest",
+                  "Referer": "https://www.instagram.com/arcana_events/",
+              })
+              r = s.get("https://www.instagram.com/api/v1/users/web_profile_info/?username=arcana_events", headers=h, timeout=25)
+              print("web_profile_info", r.status_code, r.text[:180])
+              r.raise_for_status()
+              user = r.json()["data"]["user"]
+              edges = user.get("edge_owner_to_timeline_media", {}).get("edges", [])
+              media = []
+              for e in edges:
+                  n = e.get("node", {})
+                  children = n.get("edge_sidecar_to_children", {}).get("edges")
+                  nodes = [x.get("node", {}) for x in children] if children else [n]
+                  media.extend(nodes)
+              p=v=0
+              for n in media:
+                  if n.get("is_video") and v < 3 and n.get("video_url"):
+                      v += 1
+                      u=n["video_url"]; data=s.get(u,timeout=45).content
+                      (out/f"api_video_{v}.mp4").write_bytes(data)
+                      print("saved video", v, len(data))
+                  elif (not n.get("is_video")) and p < 3 and n.get("display_url"):
+                      p += 1
+                      u=n["display_url"]; rr=s.get(u,timeout=45)
+                      ext=".jpg"
+                      ct=rr.headers.get("content-type","")
+                      if "png" in ct: ext=".png"
+                      elif "webp" in ct: ext=".webp"
+                      (out/f"api_photo_{p}{ext}").write_bytes(rr.content)
+                      print("saved photo", p, len(rr.content))
+                  if p>=3 and v>=3: break
+          except Exception as e:
+              print("public API attempt failed:", repr(e))
+          PY
+
+          echo "=== Attempt 2: gallery-dl ==="
+          gallery-dl --range 1-20 --dest raw "https://www.instagram.com/arcana_events/" || true
+
+          echo "=== Attempt 3: Instaloader profile iterator ==="
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import instaloader
+
+          def counts():
+              root=Path("raw")
+              pics=[p for p in root.rglob("*") if p.suffix.lower() in {".jpg",".jpeg",".png",".webp"}]
+              vids=[p for p in root.rglob("*.mp4")]
+              return len(pics),len(vids)
+
+          a,b=counts()
+          print("before instaloader:",a,b)
+          if a < 3 or b < 3:
+              try:
+                  L=instaloader.Instaloader(
+                      dirname_pattern="raw/insta",
+                      filename_pattern="{date_utc:%Y-%m-%d}_{shortcode}_{filename}",
+                      download_pictures=True,
+                      download_videos=True,
+                      download_video_thumbnails=False,
+                      download_geotags=False,
+                      download_comments=False,
+                      save_metadata=False,
+                      compress_json=False,
+                      post_metadata_txt_pattern="",
+                      quiet=False,
+                  )
+                  profile=instaloader.Profile.from_username(L.context,"arcana_events")
+                  for i,post in enumerate(profile.get_posts()):
+                      print("post",i,post.shortcode,post.typename,post.is_video)
+                      L.download_post(post,target="arcana_events")
+                      a,b=counts()
+                      print("counts",a,b)
+                      if a>=3 and b>=3: break
+                      if i>=24: break
+              except Exception as e:
+                  print("instaloader attempt failed:",repr(e))
+          PY
+
+          echo "=== Select exactly three photos + three videos ==="
+          python - <<'PY'
+          from pathlib import Path
+          import shutil, os
+
+          root=Path("raw")
+          sel=Path("selected")
+          sel.mkdir(exist_ok=True)
+          pics=sorted([p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".jpg",".jpeg",".png",".webp"} and "profile_pic" not in p.name.lower()])
+          vids=sorted([p for p in root.rglob("*") if p.is_file() and p.suffix.lower()==".mp4"])
+          print("photos found:",len(pics))
+          for p in pics[:20]: print(" PHOTO",p,p.stat().st_size)
+          print("videos found:",len(vids))
+          for p in vids[:20]: print(" VIDEO",p,p.stat().st_size)
+
+          # Prefer API-named files when available, otherwise choose the largest media files
+          api_p=[p for p in pics if p.name.startswith("api_photo_")]
+          api_v=[p for p in vids if p.name.startswith("api_video_")]
+          chosen_p=(api_p + [p for p in sorted(pics,key=lambda x:x.stat().st_size,reverse=True) if p not in api_p])[:3]
+          chosen_v=(api_v + [p for p in sorted(vids,key=lambda x:x.stat().st_size,reverse=True) if p not in api_v])[:3]
+
+          for i,p in enumerate(chosen_p,1):
+              shutil.copy2(p, sel/f"arcana_events_photo_{i}{p.suffix.lower()}")
+          for i,p in enumerate(chosen_v,1):
+              shutil.copy2(p, sel/f"arcana_events_video_{i}.mp4")
+
+          if len(chosen_p)<3 or len(chosen_v)<3:
+              raise SystemExit(f"Need 3 photos and 3 videos; got {len(chosen_p)} photos and {len(chosen_v)} videos")
+          print("SUCCESS")
+          PY
+      - name: Upload six files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arcana-events-media
+          path: selected/
+          if-no-files-found: warn
+          retention-days: 1
