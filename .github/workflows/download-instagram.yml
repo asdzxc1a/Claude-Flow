@@ -1,221 +1,163 @@
-name: Fetch Arcana media via public viewers
-
+name: Fetch Arcana media via Picuki worker
 on:
   push:
     branches: ["main"]
   workflow_dispatch:
-
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 4
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install browser tooling
-        run: pip install -q --upgrade playwright requests
-      - name: Resolve and download public media
+      - run: pip install -q playwright requests
+      - name: Resolve Arcana public profile
         shell: bash
         run: |
           mkdir -p selected debug
-          python - <<'PY'
-          import os, re, json, time
+          timeout 180s python - <<'PY'
+          import json, re, shutil
           from pathlib import Path
-          from urllib.parse import urljoin, urlparse
-          import requests
-          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+          from urllib.parse import urljoin
+          from playwright.sync_api import sync_playwright
 
-          TARGET="arcana_events"
-          sel=Path("selected"); dbg=Path("debug")
-          media_urls=[]
-          post_urls=[]
-          seen=set()
+          target="arcana_events"
+          out=Path("selected"); dbg=Path("debug")
+          captured=[]
+          urls=[]; seen=set()
 
-          def add_url(u):
-              if not u or not isinstance(u,str): return
-              u=u.replace("&amp;","&")
-              if u.startswith("//"): u="https:"+u
-              if u.startswith("http") and u not in seen:
-                  seen.add(u); media_urls.append(u)
+          def add(u):
+              if not isinstance(u,str) or not u.startswith("http"): return
+              if u not in seen:
+                  seen.add(u); urls.append(u)
 
-          def harvest(page, label):
-              try:
-                  page.wait_for_timeout(1200)
-                  data=page.evaluate("""() => {
-                    const attrs=[];
-                    for (const el of document.querySelectorAll('img,video,source,a')) {
-                      for (const a of ['src','href','data-src','data-url','data-download','poster']) {
-                        const v=el.getAttribute(a); if(v) attrs.push(v);
-                      }
-                    }
-                    const resources=performance.getEntriesByType('resource').map(x=>x.name);
-                    return {url:location.href, title:document.title, text:document.body.innerText.slice(0,8000), attrs, resources};
-                  }""")
-                  (dbg/f"{label}.json").write_text(json.dumps(data,ensure_ascii=False,indent=2))
-                  print("HARVEST",label,data["url"],"attrs",len(data["attrs"]),"resources",len(data["resources"]))
-                  for x in data["attrs"]+data["resources"]:
-                      if x.startswith("/"): x=urljoin(data["url"],x)
-                      lx=x.lower()
-                      if any(k in lx for k in [".jpg",".jpeg",".webp",".png",".mp4","scontent","cdninstagram","fbcdn","download"]):
-                          add_url(x)
-                      if re.search(r'/(p|reel|tv)/[^/?#]+',x):
-                          post_urls.append(urljoin(data["url"],x))
-                  return data
-              except Exception as e:
-                  print("HARVEST_ERR",label,repr(e))
-                  return {}
-
-          def submit_profile(page, base):
-              page.goto(base,wait_until="domcontentloaded",timeout=35000)
-              page.wait_for_timeout(1500)
-              print("OPEN",base,page.url,page.title())
-              inputs=page.locator("input")
-              print("inputs",inputs.count())
-              filled=False
-              for i in range(inputs.count()):
-                  try:
-                      inp=inputs.nth(i)
-                      typ=(inp.get_attribute("type") or "").lower()
-                      if typ in ("hidden","submit","button"): continue
-                      if not inp.is_visible(): continue
-                      inp.fill(TARGET)
-                      inp.press("Enter")
-                      filled=True
-                      print("SUBMITTED input",i)
-                      break
-                  except Exception as e: print("input err",i,repr(e))
-              if not filled: return False
-              try: page.wait_for_load_state("domcontentloaded",timeout=20000)
-              except: pass
-              page.wait_for_timeout(5000)
-              for _ in range(5):
-                  page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                  page.wait_for_timeout(1000)
-              return True
-
-          def save_response(resp, idx, kind):
-              try:
-                  body=resp.body()
-                  if len(body)<2000: return False
-                  ext=".mp4" if kind=="video" else ".jpg"
-                  p=sel/f"arcana_events_{kind}_{idx}{ext}"
-                  p.write_bytes(body)
-                  print("SAVED",kind,idx,len(body),resp.url)
-                  return True
-              except Exception as e:
-                  print("save response error",repr(e)); return False
+          def walk(x):
+              if isinstance(x,dict):
+                  for k,v in x.items():
+                      lk=str(k).lower()
+                      if isinstance(v,str) and (v.startswith("http") or "url" in lk):
+                          add(v)
+                      walk(v)
+              elif isinstance(x,list):
+                  for v in x: walk(v)
+              elif isinstance(x,str) and x.startswith("http"):
+                  add(x)
 
           with sync_playwright() as pw:
-              chrome="/usr/bin/google-chrome"
-              browser=pw.chromium.launch(headless=True,executable_path=chrome,args=["--no-sandbox","--disable-blink-features=AutomationControlled"])
+              chrome=shutil.which("google-chrome") or shutil.which("chromium")
+              browser=pw.chromium.launch(headless=True, executable_path=chrome, args=["--no-sandbox","--disable-blink-features=AutomationControlled"])
               ctx=browser.new_context(
-                  viewport={"width":1440,"height":1100},
+                  viewport={"width":1440,"height":1200},
                   locale="en-US",
-                  user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36",
-                  accept_downloads=True,
+                  user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
               )
               page=ctx.new_page()
 
-              # Primary viewer
-              try:
-                  if submit_profile(page,"https://picuki.site/instagram-profile-viewer"):
-                      d=harvest(page,"picuki_profile")
-                      # Collect obvious post/reel card links after result renders.
-                      hrefs=page.locator("a").evaluate_all("els => els.map(e=>e.href)")
-                      post_urls.extend([u for u in hrefs if re.search(r'/(p|reel|post|media)/',u,re.I)])
-              except Exception as e:
-                  print("PICUKI_PROFILE_ERR",repr(e))
+              def on_response(resp):
+                  u=resp.url
+                  if "api-wh.picuki.site" in u or "picuki.site/api/" in u:
+                      print("API_RESPONSE",resp.status,u)
+                      try:
+                          ct=(resp.headers.get("content-type") or "").lower()
+                          if "json" in ct:
+                              j=resp.json()
+                              captured.append({"url":u,"json":j})
+                              walk(j)
+                              print("API_JSON_KEYS", list(j.keys()) if isinstance(j,dict) else type(j).__name__)
+                          else:
+                              txt=resp.text()
+                              captured.append({"url":u,"text":txt[:20000]})
+                              print("API_TEXT",txt[:500])
+                      except Exception as e:
+                          print("API_CAPTURE_ERR",repr(e))
+              page.on("response",on_response)
 
-              # Open individual cards and harvest media/download links.
-              unique_posts=[]
-              for u in post_urls:
-                  if u not in unique_posts: unique_posts.append(u)
-              print("POST_URLS",len(unique_posts),unique_posts[:30])
-              for i,u in enumerate(unique_posts[:24]):
-                  try:
-                      p=ctx.new_page()
-                      p.goto(u,wait_until="domcontentloaded",timeout=25000)
-                      p.wait_for_timeout(1800)
-                      harvest(p,f"post_{i:02d}")
-                      p.close()
-                  except Exception as e:
-                      print("POST_ERR",u,repr(e))
+              url=f"https://picuki.site/instagram-profile-viewer?profile={target}"
+              print("OPEN_DIRECT",url)
+              page.goto(url,wait_until="domcontentloaded",timeout=35000)
+              page.wait_for_timeout(12000)
 
-              # Secondary viewers if Picuki doesn't expose enough candidates.
-              for j,base in enumerate([
-                  "https://imginn.io/",
-                  "https://thepicuki.com/",
-                  "https://dumpor.io/",
-              ]):
-                  if len(media_urls)>=10: break
-                  try:
-                      q=ctx.new_page()
-                      submit_profile(q,base)
-                      harvest(q,f"viewer_{j}")
-                      hrefs=q.locator("a").evaluate_all("els => els.map(e=>e.href)")
-                      for u in hrefs:
-                          if re.search(r'/(p|reel|post|media)/',u,re.I): post_urls.append(u)
-                      q.close()
-                  except Exception as e: print("VIEWER_ERR",base,repr(e))
+              # If a Turnstile/captcha appeared, record it instead of pretending.
+              print("TITLE",page.title(),"URL",page.url)
+              text=page.locator("body").inner_text(timeout=10000)
+              print("BODY_HEAD",re.sub(r"\s+"," ",text[:5000]))
+              (dbg/"body.txt").write_text(text)
+              (dbg/"captured.json").write_text(json.dumps(captured,ensure_ascii=False,indent=2,default=str))
 
-              print("MEDIA_CANDIDATES",len(media_urls))
-              for u in media_urls[:80]: print("CANDIDATE",u[:500])
+              # Click load-more style controls a few times if present.
+              for _ in range(4):
+                  clicked=False
+                  for pat in ["load more","more posts","show more"]:
+                      loc=page.get_by_text(re.compile(pat,re.I))
+                      for i in range(min(loc.count(),3)):
+                          try:
+                              if loc.nth(i).is_visible():
+                                  loc.nth(i).click(timeout=2000)
+                                  page.wait_for_timeout(1800)
+                                  clicked=True
+                                  break
+                          except: pass
+                      if clicked: break
+                  if not clicked: break
 
-              # Download media candidates using browser-context request so cookies/referrer state carry over.
+              # Harvest every link/src now rendered.
+              items=page.evaluate("""() => {
+                const a=[];
+                for(const el of document.querySelectorAll('a,img,video,source')){
+                  for(const k of ['href','src','data-src','poster']){
+                    const v=el.getAttribute(k); if(v) a.push({tag:el.tagName,attr:k,v,text:(el.innerText||'').trim().slice(0,80)});
+                  }
+                }
+                return a;
+              }""")
+              (dbg/"dom.json").write_text(json.dumps(items,ensure_ascii=False,indent=2))
+              for it in items:
+                  v=it["v"]
+                  if v.startswith("/"): v=urljoin(page.url,v)
+                  add(v)
+
+              print("URL_COUNT",len(urls))
+              for u in urls[:120]: print("URL",u[:600])
+
               pics=[]; vids=[]
-              for u in list(media_urls):
+              # Prefer URLs whose field/path suggests actual downloads/media.
+              def rank(u):
+                  lu=u.lower()
+                  score=0
+                  for k in ["download","media.picuki.site","cdninstagram","fbcdn","scontent",".mp4",".jpg",".jpeg",".webp",".png"]:
+                      if k in lu: score+=1
+                  return -score
+              for u in sorted(urls,key=rank):
                   if len(pics)>=3 and len(vids)>=3: break
+                  if any(x in u.lower() for x in ["google","doubleclick","analytics","svg","css","js?","fonts"]): continue
                   try:
                       r=ctx.request.get(u,timeout=25000,fail_on_status_code=False)
                       ct=(r.headers.get("content-type") or "").lower()
                       body=r.body()
-                      if r.status>=400 or len(body)<3000: continue
-                      kind=None
-                      if "video/" in ct or body[4:8] in (b"ftyp",b"moov"): kind="video"
-                      elif "image/" in ct or body[:3]==b"\xff\xd8\xff" or body[:8]==b"\x89PNG\r\n\x1a\n" or body[:4] in (b"RIFF",): kind="photo"
-                      if kind=="video" and len(vids)<3:
-                          n=len(vids)+1; path=sel/f"arcana_events_video_{n}.mp4"; path.write_bytes(body); vids.append(path)
-                          print("DOWNLOADED_VIDEO",n,len(body),ct,u[:250])
-                      elif kind=="photo" and len(pics)<3:
+                      if r.status>=400 or len(body)<5000: continue
+                      isvid=("video/" in ct) or (len(body)>12 and body[4:8]==b"ftyp")
+                      isimg=("image/" in ct) or body[:3]==b"\xff\xd8\xff" or body[:8]==b"\x89PNG\r\n\x1a\n" or (body[:4]==b"RIFF" and body[8:12]==b"WEBP")
+                      if isvid and len(vids)<3:
+                          p=out/f"arcana_events_video_{len(vids)+1}.mp4"; p.write_bytes(body); vids.append(p)
+                          print("SAVED_VIDEO",p.name,len(body),ct,u[:300])
+                      elif isimg and len(pics)<3:
                           ext=".webp" if "webp" in ct else (".png" if "png" in ct else ".jpg")
-                          n=len(pics)+1; path=sel/f"arcana_events_photo_{n}{ext}"; path.write_bytes(body); pics.append(path)
-                          print("DOWNLOADED_PHOTO",n,len(body),ct,u[:250])
+                          p=out/f"arcana_events_photo_{len(pics)+1}{ext}"; p.write_bytes(body); pics.append(p)
+                          print("SAVED_PHOTO",p.name,len(body),ct,u[:300])
                   except Exception as e:
-                      print("DL_ERR",u[:180],repr(e))
-
-              # Last-mile: click visible download buttons on resolved pages and accept browser downloads.
-              if len(pics)<3 or len(vids)<3:
-                  all_pages=[page]
-                  for p in all_pages:
-                      try:
-                          buttons=p.get_by_text(re.compile("download",re.I))
-                          for i in range(min(buttons.count(),12)):
-                              try:
-                                  with p.expect_download(timeout=4000) as info:
-                                      buttons.nth(i).click()
-                                  dl=info.value
-                                  suggested=dl.suggested_filename.lower()
-                                  temp=Path(dl.path())
-                                  if suggested.endswith(".mp4") and len(vids)<3:
-                                      dest=sel/f"arcana_events_video_{len(vids)+1}.mp4"; dest.write_bytes(temp.read_bytes()); vids.append(dest)
-                                  elif suggested.endswith((".jpg",".jpeg",".png",".webp")) and len(pics)<3:
-                                      ext=Path(suggested).suffix or ".jpg"; dest=sel/f"arcana_events_photo_{len(pics)+1}{ext}"; dest.write_bytes(temp.read_bytes()); pics.append(dest)
-                              except Exception: pass
-                      except Exception: pass
+                      print("FETCH_ERR",u[:180],repr(e))
 
               browser.close()
 
-          print("FINAL_COUNTS",len(pics),len(vids))
-          for p in sorted(sel.iterdir()):
-              print("FINAL_FILE",p.name,p.stat().st_size)
+          print("FINAL",len(pics),"photos",len(vids),"videos")
+          for p in out.iterdir(): print("FILE",p.name,p.stat().st_size)
           if len(pics)<3 or len(vids)<3:
-              raise SystemExit("Need 3 photos + 3 videos")
+              raise SystemExit("INSUFFICIENT_MEDIA")
           PY
-      - name: Upload six media files
+      - name: Upload media
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -223,7 +165,7 @@ jobs:
           path: selected/
           if-no-files-found: warn
           retention-days: 1
-      - name: Upload debug trace
+      - name: Upload debug
         if: failure()
         uses: actions/upload-artifact@v4
         with:
