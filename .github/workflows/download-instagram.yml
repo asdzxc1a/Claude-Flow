@@ -1,4 +1,4 @@
-name: Fetch Arcana media via Picuki worker
+name: Fetch Arcana media via Imginn
 on:
   push:
     branches: ["main"]
@@ -6,157 +6,305 @@ on:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 7
     permissions:
       contents: read
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -q playwright requests
-      - name: Resolve Arcana public profile
+      - run: pip install -q playwright requests beautifulsoup4
+      - name: Resolve Imginn profile and download 3 plus 3
         shell: bash
         run: |
           mkdir -p selected debug
-          timeout 180s python - <<'PY'
-          import json, re, shutil
+          timeout 360s python - <<'PY'
+          import json, re, shutil, sys, time
           from pathlib import Path
-          from urllib.parse import urljoin
+          from urllib.parse import urljoin, urlparse, quote
           from playwright.sync_api import sync_playwright
 
-          target="arcana_events"
-          out=Path("selected"); dbg=Path("debug")
-          captured=[]
-          urls=[]; seen=set()
+          TARGET="arcana_events"
+          OUT=Path("selected"); DBG=Path("debug")
+          source_urls=[]
+          post_urls=[]
+          seen=set()
 
-          def add(u):
-              if not isinstance(u,str) or not u.startswith("http"): return
-              if u not in seen:
-                  seen.add(u); urls.append(u)
+          def add_media(u, source=""):
+              if not isinstance(u,str): return
+              u=u.strip().replace("&amp;","&")
+              if u.startswith("//"): u="https:"+u
+              if not u.startswith("http"): return
+              if u in seen: return
+              lu=u.lower()
+              # Exclude obvious website UI assets/ads.
+              if any(x in lu for x in ["googletagmanager","google-analytics","doubleclick","fonts.gstatic","fonts.googleapis","favicon","logo.svg","/assets/","/css/","/js/"]):
+                  return
+              seen.add(u)
+              source_urls.append({"url":u,"source":source})
 
-          def walk(x):
-              if isinstance(x,dict):
-                  for k,v in x.items():
-                      lk=str(k).lower()
-                      if isinstance(v,str) and (v.startswith("http") or "url" in lk):
-                          add(v)
-                      walk(v)
-              elif isinstance(x,list):
-                  for v in x: walk(v)
-              elif isinstance(x,str) and x.startswith("http"):
-                  add(x)
+          def add_post(u, base):
+              if not isinstance(u,str): return
+              if u.startswith("/"): u=urljoin(base,u)
+              if not u.startswith("http"): return
+              if re.search(r'imginn\.com/(?:p|reel|reels)/[^/?#]+',u,re.I) and u not in post_urls:
+                  post_urls.append(u)
+
+          def harvest_page(page,label,allow_same_host_images=False):
+              page.wait_for_timeout(1200)
+              data=page.evaluate("""() => {
+                const items=[];
+                for(const el of document.querySelectorAll('a[href],img[src],video[src],source[src],video[poster]')){
+                  for(const k of ['href','src','poster','data-src','data-url','data-download']){
+                    const v=el.getAttribute(k);
+                    if(v) items.push({tag:el.tagName,attr:k,v,text:(el.innerText||el.alt||'').trim().slice(0,160),cls:el.className||''});
+                  }
+                }
+                const perf=performance.getEntriesByType('resource').map(x=>x.name);
+                return {url:location.href,title:document.title,body:document.body.innerText.slice(0,12000),items,perf};
+              }""")
+              (DBG/f"{label}.json").write_text(json.dumps(data,ensure_ascii=False,indent=2))
+              print("HARVEST",label,"url",data["url"],"items",len(data["items"]),"perf",len(data["perf"]))
+              base=data["url"]
+              for it in data["items"]:
+                  v=it["v"]
+                  if v.startswith("/"): v=urljoin(base,v)
+                  add_post(v,base)
+                  lv=v.lower()
+                  if it["tag"] in ("IMG","VIDEO","SOURCE") or "download" in (it["text"]+" "+it["cls"]).lower() or any(k in lv for k in [".mp4",".jpg",".jpeg",".webp",".png","cdninstagram","fbcdn","scontent"]):
+                      # Same-host imgs are accepted only on post/profile result pages, not homepage UI.
+                      if allow_same_host_images or urlparse(v).netloc not in ("imginn.com","www.imginn.com"):
+                          add_media(v,f"{label}:{it['tag']}:{it['attr']}:{it['text'][:50]}")
+              for v in data["perf"]:
+                  lv=v.lower()
+                  if any(k in lv for k in [".mp4",".jpg",".jpeg",".webp",".png","cdninstagram","fbcdn","scontent"]):
+                      if allow_same_host_images or urlparse(v).netloc not in ("imginn.com","www.imginn.com"):
+                          add_media(v,f"{label}:network")
+              return data
+
+          def profile_match(text):
+              t=text.lower().replace("@","")
+              return TARGET.lower() in t
 
           with sync_playwright() as pw:
-              chrome=shutil.which("google-chrome") or shutil.which("chromium")
-              browser=pw.chromium.launch(headless=True, executable_path=chrome, args=["--no-sandbox","--disable-blink-features=AutomationControlled"])
-              ctx=browser.new_context(
+              chrome=shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+              print("CHROME",chrome)
+              browser=pw.chromium.launch(headless=True,executable_path=chrome,args=["--no-sandbox","--disable-blink-features=AutomationControlled"])
+              ctx=pw.chromium.launch if False else browser.new_context(
                   viewport={"width":1440,"height":1200},
                   locale="en-US",
-                  user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+                  user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36",
+                  accept_downloads=True,
               )
               page=ctx.new_page()
 
-              def on_response(resp):
-                  u=resp.url
-                  if "api-wh.picuki.site" in u or "picuki.site/api/" in u:
-                      print("API_RESPONSE",resp.status,u)
-                      try:
-                          ct=(resp.headers.get("content-type") or "").lower()
-                          if "json" in ct:
-                              j=resp.json()
-                              captured.append({"url":u,"json":j})
-                              walk(j)
-                              print("API_JSON_KEYS", list(j.keys()) if isinstance(j,dict) else type(j).__name__)
-                          else:
-                              txt=resp.text()
-                              captured.append({"url":u,"text":txt[:20000]})
-                              print("API_TEXT",txt[:500])
-                      except Exception as e:
-                          print("API_CAPTURE_ERR",repr(e))
-              page.on("response",on_response)
+              # 1) Try direct profile path used by Imginn for every indexed profile.
+              direct=f"https://imginn.com/{TARGET}/"
+              try:
+                  print("DIRECT",direct)
+                  page.goto(direct,wait_until="domcontentloaded",timeout=35000)
+                  page.wait_for_timeout(3500)
+                  print("DIRECT_STATUS_TITLE",page.url,page.title())
+                  body=page.locator("body").inner_text(timeout=10000)
+                  print("DIRECT_BODY",re.sub(r"\s+"," ",body[:3000]))
+                  if profile_match(body) and "not found" not in body.lower():
+                      for _ in range(5):
+                          page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                          page.wait_for_timeout(700)
+                      harvest_page(page,"profile_direct",True)
+              except Exception as e:
+                  print("DIRECT_ERR",repr(e))
 
-              url=f"https://picuki.site/instagram-profile-viewer?profile={target}"
-              print("OPEN_DIRECT",url)
-              page.goto(url,wait_until="domcontentloaded",timeout=35000)
-              page.wait_for_timeout(12000)
-
-              # If a Turnstile/captcha appeared, record it instead of pretending.
-              print("TITLE",page.title(),"URL",page.url)
-              text=page.locator("body").inner_text(timeout=10000)
-              print("BODY_HEAD",re.sub(r"\s+"," ",text[:5000]))
-              (dbg/"body.txt").write_text(text)
-              (dbg/"captured.json").write_text(json.dumps(captured,ensure_ascii=False,indent=2,default=str))
-
-              # Click load-more style controls a few times if present.
-              for _ in range(4):
-                  clicked=False
-                  for pat in ["load more","more posts","show more"]:
-                      loc=page.get_by_text(re.compile(pat,re.I))
-                      for i in range(min(loc.count(),3)):
+              # 2) Search from homepage if direct path did not resolve usable post links.
+              if not post_urls:
+                  try:
+                      page.goto("https://imginn.com/",wait_until="domcontentloaded",timeout=35000)
+                      page.wait_for_timeout(1500)
+                      print("HOME",page.title(),page.url)
+                      # Prefer inputs mentioning Instagram name/user.
+                      inputs=page.locator("input")
+                      print("INPUTS",inputs.count())
+                      submitted=False
+                      for i in range(inputs.count()):
+                          inp=inputs.nth(i)
                           try:
-                              if loc.nth(i).is_visible():
-                                  loc.nth(i).click(timeout=2000)
-                                  page.wait_for_timeout(1800)
-                                  clicked=True
-                                  break
+                              if not inp.is_visible(): continue
+                              typ=(inp.get_attribute("type") or "text").lower()
+                              ph=(inp.get_attribute("placeholder") or "").lower()
+                              if typ in ("hidden","submit","button","file"): continue
+                              score=("instagram" in ph)*3+("name" in ph)+("user" in ph)+("profile" in ph)
+                              print("INPUT",i,typ,ph,"score",score)
                           except: pass
-                      if clicked: break
-                  if not clicked: break
+                      candidates=[]
+                      for i in range(inputs.count()):
+                          try:
+                              inp=inputs.nth(i)
+                              if not inp.is_visible(): continue
+                              typ=(inp.get_attribute("type") or "text").lower()
+                              if typ in ("hidden","submit","button","file"): continue
+                              ph=(inp.get_attribute("placeholder") or "").lower()
+                              score=("instagram" in ph)*3+("name" in ph)+("user" in ph)+("profile" in ph)
+                              candidates.append((score,i))
+                          except: pass
+                      for _,i in sorted(candidates,reverse=True):
+                          try:
+                              inp=inputs.nth(i)
+                              inp.fill(TARGET)
+                              inp.press("Enter")
+                              submitted=True
+                              print("SUBMITTED",i)
+                              break
+                          except Exception as e: print("SUBMIT_INPUT_ERR",i,repr(e))
+                      if submitted:
+                          try: page.wait_for_load_state("domcontentloaded",timeout=20000)
+                          except: pass
+                          page.wait_for_timeout(5000)
+                          print("AFTER_SEARCH",page.url,page.title())
+                          body=page.locator("body").inner_text()
+                          print("SEARCH_BODY",re.sub(r"\s+"," ",body[:5000]))
+                          # Click an exact target profile link/card when search results are shown.
+                          links=page.locator("a")
+                          hit=None
+                          for i in range(min(links.count(),400)):
+                              try:
+                                  a=links.nth(i)
+                                  txt=(a.inner_text() or "").strip().lower()
+                                  href=a.get_attribute("href") or ""
+                                  if TARGET.lower() in (txt+" "+href).lower():
+                                      hit=a; print("PROFILE_HIT",i,txt,href); break
+                              except: pass
+                          if hit:
+                              try:
+                                  hit.click()
+                                  try: page.wait_for_load_state("domcontentloaded",timeout=20000)
+                                  except: pass
+                                  page.wait_for_timeout(3500)
+                              except Exception as e: print("PROFILE_CLICK_ERR",repr(e))
+                          for _ in range(5):
+                              page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                              page.wait_for_timeout(700)
+                          harvest_page(page,"profile_search",True)
+                  except Exception as e:
+                      print("SEARCH_ERR",repr(e))
 
-              # Harvest every link/src now rendered.
-              items=page.evaluate("""() => {
-                const a=[];
-                for(const el of document.querySelectorAll('a,img,video,source')){
-                  for(const k of ['href','src','data-src','poster']){
-                    const v=el.getAttribute(k); if(v) a.push({tag:el.tagName,attr:k,v,text:(el.innerText||'').trim().slice(0,80)});
-                  }
-                }
-                return a;
-              }""")
-              (dbg/"dom.json").write_text(json.dumps(items,ensure_ascii=False,indent=2))
-              for it in items:
-                  v=it["v"]
-                  if v.startswith("/"): v=urljoin(page.url,v)
-                  add(v)
+              # 3) Explicitly click Posts and Reels tabs if available to expose more links.
+              for tabname in ["POSTS","REELS","Posts","Reels"]:
+                  try:
+                      loc=page.get_by_text(tabname,exact=True)
+                      if loc.count() and loc.first.is_visible():
+                          loc.first.click()
+                          page.wait_for_timeout(2500)
+                          for _ in range(3):
+                              page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                              page.wait_for_timeout(600)
+                          harvest_page(page,"tab_"+tabname.lower(),True)
+                  except Exception as e:
+                      print("TAB_ERR",tabname,repr(e))
 
-              print("URL_COUNT",len(urls))
-              for u in urls[:120]: print("URL",u[:600])
+              print("POST_URLS_INITIAL",len(post_urls))
+              for u in post_urls[:80]: print("POST_URL",u)
+
+              # 4) Open individual posts/Reels; these pages expose Download anchors and media.
+              for idx,u in enumerate(post_urls[:35]):
+                  try:
+                      p=ctx.new_page()
+                      p.goto(u,wait_until="domcontentloaded",timeout=30000)
+                      p.wait_for_timeout(1800)
+                      harvest_page(p,f"post_{idx:02d}",True)
+                      p.close()
+                  except Exception as e:
+                      print("POST_OPEN_ERR",u,repr(e))
+
+              print("MEDIA_URLS",len(source_urls))
+              for x in source_urls[:150]: print("MEDIA_CANDIDATE",x["source"],x["url"][:700])
 
               pics=[]; vids=[]
-              # Prefer URLs whose field/path suggests actual downloads/media.
-              def rank(u):
-                  lu=u.lower()
+              used_hashes=set()
+              # Prefer CDN/direct media and links discovered from individual posts over profile UI.
+              def priority(item):
+                  u=item["url"].lower(); s=item["source"].lower()
                   score=0
-                  for k in ["download","media.picuki.site","cdninstagram","fbcdn","scontent",".mp4",".jpg",".jpeg",".webp",".png"]:
-                      if k in lu: score+=1
+                  if "post_" in s: score+=10
+                  if any(h in u for h in ["cdninstagram","fbcdn","scontent"]): score+=8
+                  if ".mp4" in u: score+=7
+                  if any(ext in u for ext in [".jpg",".jpeg",".webp",".png"]): score+=5
+                  if "download" in s or "download" in u: score+=4
+                  if "profile" in s: score+=1
                   return -score
-              for u in sorted(urls,key=rank):
+
+              for item in sorted(source_urls,key=priority):
                   if len(pics)>=3 and len(vids)>=3: break
-                  if any(x in u.lower() for x in ["google","doubleclick","analytics","svg","css","js?","fonts"]): continue
+                  u=item["url"]
+                  lu=u.lower()
+                  if any(x in lu for x in ["imginn.com/images/","imginn.com/assets/","logo","favicon","icon"]): continue
                   try:
-                      r=ctx.request.get(u,timeout=25000,fail_on_status_code=False)
+                      r=ctx.request.get(u,timeout=30000,fail_on_status_code=False,headers={"Referer":"https://imginn.com/"})
                       ct=(r.headers.get("content-type") or "").lower()
                       body=r.body()
-                      if r.status>=400 or len(body)<5000: continue
+                      if r.status>=400 or len(body)<12000: continue
+                      sig=hash(body[:4096]+body[-4096:]+str(len(body)).encode())
+                      if sig in used_hashes: continue
                       isvid=("video/" in ct) or (len(body)>12 and body[4:8]==b"ftyp")
-                      isimg=("image/" in ct) or body[:3]==b"\xff\xd8\xff" or body[:8]==b"\x89PNG\r\n\x1a\n" or (body[:4]==b"RIFF" and body[8:12]==b"WEBP")
+                      isimg=("image/" in ct) or body[:3]==b"\xff\xd8\xff" or body[:8]==b"\x89PNG\r\n\x1a\n" or (len(body)>12 and body[:4]==b"RIFF" and body[8:12]==b"WEBP")
                       if isvid and len(vids)<3:
-                          p=out/f"arcana_events_video_{len(vids)+1}.mp4"; p.write_bytes(body); vids.append(p)
-                          print("SAVED_VIDEO",p.name,len(body),ct,u[:300])
+                          used_hashes.add(sig)
+                          p=OUT/f"arcana_events_video_{len(vids)+1}.mp4"; p.write_bytes(body); vids.append(p)
+                          print("SAVED_VIDEO",p.name,len(body),ct,item["source"],u[:400])
                       elif isimg and len(pics)<3:
+                          # Ignore tiny UI-ish images.
+                          if len(body)<40000: continue
+                          used_hashes.add(sig)
                           ext=".webp" if "webp" in ct else (".png" if "png" in ct else ".jpg")
-                          p=out/f"arcana_events_photo_{len(pics)+1}{ext}"; p.write_bytes(body); pics.append(p)
-                          print("SAVED_PHOTO",p.name,len(body),ct,u[:300])
+                          p=OUT/f"arcana_events_photo_{len(pics)+1}{ext}"; p.write_bytes(body); pics.append(p)
+                          print("SAVED_PHOTO",p.name,len(body),ct,item["source"],u[:400])
                   except Exception as e:
-                      print("FETCH_ERR",u[:180],repr(e))
+                      print("DOWNLOAD_ERR",u[:220],repr(e))
+
+              # 5) If direct URLs did not produce enough, click Download anchors and capture browser downloads.
+              if len(pics)<3 or len(vids)<3:
+                  print("CLICK_DOWNLOAD_FALLBACK")
+                  for idx,u in enumerate(post_urls[:25]):
+                      if len(pics)>=3 and len(vids)>=3: break
+                      try:
+                          p=ctx.new_page(); p.goto(u,wait_until="domcontentloaded",timeout=25000); p.wait_for_timeout(1000)
+                          loc=p.get_by_text(re.compile("^Download$",re.I))
+                          for j in range(min(loc.count(),8)):
+                              if len(pics)>=3 and len(vids)>=3: break
+                              try:
+                                  el=loc.nth(j)
+                                  href=el.get_attribute("href")
+                                  if href:
+                                      if href.startswith("/"): href=urljoin(p.url,href)
+                                      add_media(href,f"clicked_post_{idx}")
+                                      continue
+                                  with p.expect_download(timeout=5000) as info:
+                                      el.click()
+                                  dl=info.value; temp=Path(dl.path()); name=(dl.suggested_filename or "").lower()
+                                  b=temp.read_bytes()
+                                  if name.endswith(".mp4") and len(vids)<3:
+                                      dest=OUT/f"arcana_events_video_{len(vids)+1}.mp4"; dest.write_bytes(b); vids.append(dest)
+                                  elif name.endswith((".jpg",".jpeg",".png",".webp")) and len(pics)<3:
+                                      ext=Path(name).suffix or ".jpg"; dest=OUT/f"arcana_events_photo_{len(pics)+1}{ext}"; dest.write_bytes(b); pics.append(dest)
+                              except Exception as e: print("CLICK_DL_ERR",idx,j,repr(e))
+                          p.close()
+                      except Exception as e: print("CLICK_POST_ERR",u,repr(e))
 
               browser.close()
 
-          print("FINAL",len(pics),"photos",len(vids),"videos")
-          for p in out.iterdir(): print("FILE",p.name,p.stat().st_size)
+          print("FINAL_COUNTS",len(pics),len(vids))
+          for p in sorted(OUT.iterdir()):
+              print("FINAL_FILE",p.name,p.stat().st_size)
+          (DBG/"media_candidates.json").write_text(json.dumps(source_urls,ensure_ascii=False,indent=2))
+          (DBG/"post_urls.json").write_text(json.dumps(post_urls,ensure_ascii=False,indent=2))
           if len(pics)<3 or len(vids)<3:
               raise SystemExit("INSUFFICIENT_MEDIA")
           PY
+      - name: Verify files
+        if: success()
+        run: |
+          file selected/*
+          test "$(find selected -type f -iname '*.mp4' | wc -l)" -eq 3
+          test "$(find selected -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) | wc -l)" -eq 3
       - name: Upload media
         if: always()
         uses: actions/upload-artifact@v4
@@ -169,7 +317,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: arcana-debug
+          name: arcana-imginn-debug
           path: debug/
           if-no-files-found: warn
           retention-days: 1
