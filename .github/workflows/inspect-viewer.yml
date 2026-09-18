@@ -11,27 +11,31 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -q requests
-      - name: Extract resolver code
+      - name: Probe Picuki worker API
         shell: bash
         run: |
           python - <<'PY'
-          import re, requests
-          u="https://picuki.site/js/app.js?id=dd573be95481622498e5086ebc4dbc9a"
-          s=requests.Session(); s.headers["User-Agent"]="Mozilla/5.0"
-          t=s.get(u,timeout=30).text
-          print("LEN",len(t))
-          needles=["handleSearchButtonClick","media-search","instagram-profile","profile-viewer","axios","fetch(","/api/","searchProfile","profileSearch","downloadMedia"]
-          for needle in needles:
-              starts=[m.start() for m in re.finditer(re.escape(needle),t,re.I)]
-              print("\nNEEDLE",needle,"COUNT",len(starts))
-              for pos in starts[:20]:
-                  print("CTX",t[max(0,pos-1800):pos+3500])
-          # Print suspicious quoted strings, deduped.
-          vals=re.findall(r'["\']([^"\']{3,220})["\']',t)
-          seen=set()
-          for v in vals:
-              lv=v.lower()
-              if v in seen: continue
-              if any(k in lv for k in ["instagram","profile","search","media","download","api/","graphql"]):
-                  seen.add(v); print("STR",v)
+          import json, requests
+          s=requests.Session()
+          s.headers.update({
+            "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+            "Accept":"application/json, text/plain, */*",
+            "Origin":"https://picuki.site",
+            "Referer":"https://picuki.site/",
+          })
+          root="https://api-wh.picuki.site/api/v1/instagram"
+          tests=[
+            ("profile",{"username":"arcana_events"}),
+            ("userInfo",{"username":"arcana_events"}),
+            ("postsV2",{"username":"arcana_events","maxId":""}),
+            ("posts",{"username":"arcana_events","maxId":""}),
+            ("usernameSuggestions",{"query":"arcana_events"}),
+          ]
+          for ep,body in tests:
+            try:
+              r=s.post(f"{root}/{ep}",json=body,timeout=30)
+              print("ENDPOINT",ep,"STATUS",r.status_code,"CT",r.headers.get("content-type"),"LEN",len(r.content))
+              print("HEAD",r.text[:12000])
+            except Exception as e:
+              print("ERR",ep,repr(e))
           PY
