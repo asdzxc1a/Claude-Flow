@@ -1,4 +1,4 @@
-name: Fetch Arcana media via relay pool
+name: Fetch Arcana media via Tracygram API
 on:
   push:
     branches: ["main"]
@@ -6,239 +6,194 @@ on:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 9
+    timeout-minutes: 6
     permissions:
       contents: read
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -q playwright requests
-      - name: Query public profile relays
+      - run: pip install -q requests
+      - name: Fetch verified target media
         shell: bash
         run: |
           mkdir -p selected debug
-          timeout 480s python - <<'PY'
-          import json,re,shutil,hashlib
+          python - <<'PY'
+          import json, os, hashlib, time
           from pathlib import Path
-          from urllib.parse import urljoin,urlparse
-          from playwright.sync_api import sync_playwright
+          import requests
 
           TARGET="arcana_events"
-          OUT=Path("selected"); DBG=Path("debug")
-          candidates=[]; seen=set(); results=[]; resolved_pages=[]
-          pics=[]; vids=[]; hashes=set()
+          OUT=Path("selected")
+          DBG=Path("debug")
+          s=requests.Session()
+          s.headers.update({
+              "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+              "Accept":"application/json,text/plain,*/*",
+              "Referer":f"https://tracygram.com/viewer?u={TARGET}",
+              "Origin":"https://tracygram.com",
+          })
 
-          def add(u,src):
-              if not isinstance(u,str): return
-              u=u.strip().replace("&amp;","&")
-              if u.startswith("//"): u="https:"+u
-              if not u.startswith("http"): return
-              lu=u.lower()
-              if any(x in lu for x in ["googletagmanager","google-analytics","doubleclick","fonts.gstatic","fonts.googleapis","favicon","logo.svg","/css/","/js/","/assets/"]): return
-              if u not in seen:
-                  seen.add(u); candidates.append({"url":u,"source":src})
+          def get_json(url, params=None):
+              r=s.get(url,params=params,timeout=30)
+              print("GET",r.url,"STATUS",r.status_code,"CT",r.headers.get("content-type"),"LEN",len(r.content))
+              print("HEAD",r.text[:700].replace("\n"," "))
+              r.raise_for_status()
+              j=r.json()
+              return j
 
-          def walk(x,src):
-              if isinstance(x,dict):
-                  for k,v in x.items():
-                      lk=str(k).lower()
-                      if isinstance(v,str) and (v.startswith("http") or any(q in lk for q in ["url","src","image","video","media","download"])):
-                          add(v,src+":"+str(k))
-                      walk(v,src+":"+str(k))
-              elif isinstance(x,list):
-                  for i,v in enumerate(x): walk(v,src+f":{i}")
-              elif isinstance(x,str) and x.startswith("http"): add(x,src)
+          # Strict identity check: reject samples/defaults/renamed results.
+          user=get_json("https://tracygram.com/api/user",{"username":TARGET})
+          (DBG/"user.json").write_text(json.dumps(user,ensure_ascii=False,indent=2))
+          if not user.get("success"):
+              raise SystemExit("USER_LOOKUP_FAILED")
+          returned=(user.get("username") or "").lstrip("@").lower()
+          print("RETURNED_USERNAME",returned)
+          if returned != TARGET.lower():
+              raise SystemExit(f"WRONG_PROFILE:{returned}")
+          if user.get("is_private"):
+              raise SystemExit("TARGET_IS_PRIVATE")
+          uid=user.get("user_id")
+          print("VERIFIED_TARGET",TARGET,"USER_ID",uid,"FULL_NAME",user.get("full_name"))
 
-          def is_resolved(body):
-              b=body.lower()
-              return TARGET.lower() in b and not any(x in b for x in ["enter instagram username","enter @username"]) or ("@" + TARGET.lower()) in b
+          # Fetch first page and attempt several observed/common cursor parameter names
+          # only when more pages are needed.
+          pages=[]
+          first=get_json("https://tracygram.com/api/posts",{"username":TARGET})
+          pages.append(first)
+          (DBG/"posts_page_1.json").write_text(json.dumps(first,ensure_ascii=False,indent=2))
 
-          def classify_download(ctx,item):
-              global pics,vids
-              if len(pics)>=3 and len(vids)>=3: return
-              u=item["url"]; lu=u.lower()
-              if any(x in lu for x in ["logo","favicon",".svg","/icons/","/images/hero","/images/feature"]): return
-              try:
-                  r=ctx.request.get(u,timeout=22000,fail_on_status_code=False)
-                  ct=(r.headers.get("content-type") or "").lower(); b=r.body()
-                  if r.status>=400 or len(b)<12000: return
-                  h=hashlib.sha256(b).hexdigest()
-                  if h in hashes: return
-                  isv="video/" in ct or (len(b)>12 and b[4:8]==b"ftyp")
-                  isi="image/" in ct or b[:3]==b"\xff\xd8\xff" or b[:8]==b"\x89PNG\r\n\x1a\n" or (len(b)>12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP")
-                  if isv and len(vids)<3:
-                      hashes.add(h); p=OUT/f"arcana_events_video_{len(vids)+1}.mp4"; p.write_bytes(b); vids.append(p)
-                      print("SAVED_VIDEO",p.name,len(b),ct,item["source"],u[:350])
-                  elif isi and len(pics)<3 and len(b)>=40000:
-                      hashes.add(h); ext=".webp" if "webp" in ct else (".png" if "png" in ct else ".jpg")
-                      p=OUT/f"arcana_events_photo_{len(pics)+1}{ext}"; p.write_bytes(b); pics.append(p)
-                      print("SAVED_PHOTO",p.name,len(b),ct,item["source"],u[:350])
-              except Exception as e:
-                  print("DL_ERR",u[:180],repr(e))
+          def flatten(posts):
+              out=[]
+              for post in posts:
+                  shortcode=post.get("shortcode")
+                  post_url=post.get("url")
+                  slides=post.get("slides") or []
+                  if slides:
+                      for idx,sl in enumerate(slides):
+                          out.append({
+                            "shortcode":shortcode,"post_url":post_url,"slide":idx+1,
+                            "is_video":bool(sl.get("is_video")),
+                            "media_url":sl.get("media_url"),
+                            "thumbnail":sl.get("thumbnail") or sl.get("poster")
+                          })
+                  else:
+                      out.append({
+                        "shortcode":shortcode,"post_url":post_url,"slide":1,
+                        "is_video":bool(post.get("is_video")),
+                        "media_url":post.get("media_url"),
+                        "thumbnail":post.get("thumbnail") or post.get("poster")
+                      })
+              return out
 
-          def harvest(page,label,resolved):
-              data=page.evaluate("""() => {
-                const items=[];
-                for(const el of document.querySelectorAll('a[href],img[src],video[src],source[src],video[poster]')){
-                  for(const k of ['href','src','poster','data-src','data-url','data-download']){
-                    const v=el.getAttribute(k); if(v) items.push({tag:el.tagName,attr:k,v,text:(el.innerText||el.alt||'').trim().slice(0,180),cls:el.className||''});
-                  }
-                }
-                return {url:location.href,title:document.title,body:document.body.innerText.slice(0,18000),items,
-                        perf:performance.getEntriesByType('resource').map(x=>x.name)};
-              }""")
-              (DBG/f"{label}.json").write_text(json.dumps(data,ensure_ascii=False,indent=2))
-              print("HARVEST",label,"resolved",resolved,"url",data["url"],"BODY",re.sub(r"\s+"," ",data["body"][:2200]))
-              if not resolved: return data
-              base=data["url"]
-              for it in data["items"]:
-                  v=it["v"]
-                  if v.startswith("/"): v=urljoin(base,v)
-                  lv=v.lower(); meta=(it["text"]+" "+str(it["cls"])).lower()
-                  if it["tag"] in ("IMG","VIDEO","SOURCE") or "download" in meta or any(k in lv for k in [".mp4",".jpg",".jpeg",".webp",".png","cdninstagram","fbcdn","scontent"]):
-                      add(v,label+":"+it["tag"]+":"+it["attr"]+":"+it["text"][:50])
-              for v in data["perf"]:
-                  if any(k in v.lower() for k in [".mp4",".jpg",".jpeg",".webp",".png","cdninstagram","fbcdn","scontent"]):
-                      add(v,label+":perf")
-              return data
+          all_posts=list(first.get("posts") or [])
+          seen_shortcodes={p.get("shortcode") for p in all_posts}
+          def counts():
+              items=flatten(all_posts)
+              photos=sum(1 for x in items if not x["is_video"] and x.get("media_url"))
+              videos=sum(1 for x in items if x["is_video"] and x.get("media_url"))
+              return photos,videos
+          print("PAGE1_POSTS",len(all_posts),"MEDIA_COUNTS",counts(),"HAS_NEXT",first.get("has_next_page"))
 
-          with sync_playwright() as pw:
-              chrome=shutil.which("google-chrome") or shutil.which("chromium")
-              browser=pw.chromium.launch(headless=True,executable_path=chrome,args=["--no-sandbox","--disable-blink-features=AutomationControlled"])
-              ctx=browser.new_context(viewport={"width":1440,"height":1200},locale="en-US",
-                  user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
-                  accept_downloads=True)
-
-              sites=[
-                  ("https://www.ignony.com/instagram-profile-viewer","ignony"),
-                  ("https://igviewer.net/","igviewer"),
-                  ("https://viewer.gwaa.net/","gwaa"),
-                  ("https://tracygram.com/","tracygram"),
-                  ("https://instaincognito.com/en/instagram-profile-viewer","instaincognito"),
-                  ("https://protonviewer.com/instagram-profile-viewer","protonviewer"),
-                  ("https://www.instaviewer.dev/","instaviewer"),
-              ]
-
-              for url,label in sites:
-                  if len(pics)>=3 and len(vids)>=3: break
-                  page=ctx.new_page()
-                  def onresp(resp,lbl=label):
-                      u=resp.url; lu=u.lower()
-                      if any(k in lu for k in ["api","profile","instagram","search","media","post","reel"]) and "google" not in lu:
-                          try:
-                              ct=(resp.headers.get("content-type") or "").lower()
-                              if "json" in ct:
-                                  j=resp.json(); walk(j,lbl+":json")
-                                  results.append({"site":lbl,"url":u,"status":resp.status,"json":j})
-                                  print("JSON",lbl,resp.status,u,str(j)[:1400])
-                              elif any(x in ct for x in ["text/html","text/plain"]):
-                                  txt=resp.text()
-                                  results.append({"site":lbl,"url":u,"status":resp.status,"text":txt[:12000]})
-                                  for m in re.findall(r'https?://[^"\'<>\\ ]+',txt): add(m,lbl+":response")
-                          except Exception as e: print("RESP_ERR",lbl,u,repr(e))
-                  page.on("response",onresp)
+          page_no=1
+          cursor=first.get("end_cursor")
+          # Discover the accepted pagination argument safely by trying standard names.
+          while cursor and page_no<5 and counts()[1] < 3:
+              got_new=False
+              for key in ["cursor","after","end_cursor","max_id"]:
                   try:
-                      print("OPEN",label,url)
-                      page.goto(url,wait_until="domcontentloaded",timeout=30000); page.wait_for_timeout(1000)
-                      inputs=page.locator("input")
-                      scored=[]
-                      for i in range(inputs.count()):
-                          try:
-                              x=inputs.nth(i)
-                              if not x.is_visible(): continue
-                              typ=(x.get_attribute("type") or "text").lower()
-                              if typ in ("hidden","submit","button","file","password","email"): continue
-                              ph=(x.get_attribute("placeholder") or "").lower(); nm=(x.get_attribute("name") or "").lower()
-                              score=("username" in ph)*5+("instagram" in ph)*4+("profile" in ph)*3+("user" in nm)*2+("handle" in ph)*2
-                              scored.append((score,i,ph,nm))
-                          except: pass
-                      print("INPUTS",label,scored)
-                      if not scored:
-                          harvest(page,label+"_noinput",False); page.close(); continue
-                      _,ii,_,_=sorted(scored,reverse=True)[0]
-                      inp=inputs.nth(ii); inp.fill(TARGET)
-                      submitted=False
-                      try:
-                          inp.press("Enter"); submitted=True
-                      except: pass
-                      page.wait_for_timeout(1000)
-                      # Click a likely action after/if enter doesn't trigger the lookup.
-                      for selector_text in ["View Profile","Search","View Now","View","Read anonymously","Start Anonymous Viewing"]:
-                          try:
-                              loc=page.get_by_text(re.compile("^"+re.escape(selector_text)+"$",re.I))
-                              if loc.count() and loc.first.is_visible():
-                                  loc.first.click(timeout=1800); print("CLICK",label,selector_text); submitted=True; break
-                          except: pass
-                      try: page.wait_for_load_state("domcontentloaded",timeout=10000)
-                      except: pass
-                      page.wait_for_timeout(6500)
-                      body=page.locator("body").inner_text(timeout=10000)
-                      resolved=is_resolved(body)
-                      low=body.lower()
-                      state="resolved" if resolved else ("private" if "account is private" in low or "profile is private" in low else ("not_found" if "not found" in low else "unresolved"))
-                      print("STATE",label,state,page.url)
-                      data=harvest(page,label,resolved)
-                      if resolved:
-                          resolved_pages.append(label)
-                          # Click tabs/controls to expose media cards.
-                          for word in ["Posts","Reels","POSTS","REELS","Load more","Show more"]:
-                              try:
-                                  loc=page.get_by_text(word,exact=True)
-                                  if loc.count() and loc.first.is_visible():
-                                      loc.first.click(timeout=1500); page.wait_for_timeout(1800)
-                                      harvest(page,label+"_"+word.lower().replace(" ","_"),True)
-                              except: pass
-                          for _ in range(3):
-                              page.evaluate("window.scrollTo(0,document.body.scrollHeight)"); page.wait_for_timeout(700)
-                          harvest(page,label+"_scroll",True)
-
-                          # Open likely post/reel/content links from resolved page.
-                          hrefs=page.locator("a[href]").evaluate_all("els=>els.map(e=>e.href)")
-                          opens=[]
-                          for h in hrefs:
-                              lh=h.lower()
-                              if any(k in lh for k in ["/post","/reel","/media","/p/"]) and h not in opens: opens.append(h)
-                          print("OPEN_LINKS",label,len(opens))
-                          for j,h in enumerate(opens[:18]):
-                              try:
-                                  p=ctx.new_page(); p.goto(h,wait_until="domcontentloaded",timeout=20000); p.wait_for_timeout(900)
-                                  harvest(p,f"{label}_item_{j}",True); p.close()
-                              except Exception as e: print("ITEM_ERR",label,h,repr(e))
-
-                      # Try current candidate pool after each site.
-                      for item in list(candidates):
-                          if len(pics)>=3 and len(vids)>=3: break
-                          classify_download(ctx,item)
-                      page.close()
+                      j=get_json("https://tracygram.com/api/posts",{"username":TARGET,key:cursor})
                   except Exception as e:
-                      print("SITE_ERR",label,repr(e))
-                      try: harvest(page,label+"_err",False)
-                      except: pass
-                      try: page.close()
-                      except: pass
+                      print("CURSOR_ERR",key,repr(e)); continue
+                  new=[p for p in (j.get("posts") or []) if p.get("shortcode") not in seen_shortcodes]
+                  print("CURSOR_TRY",key,"posts",len(j.get("posts") or []),"new",len(new),"next",j.get("has_next_page"))
+                  if new:
+                      page_no+=1
+                      pages.append(j)
+                      (DBG/f"posts_page_{page_no}.json").write_text(json.dumps(j,ensure_ascii=False,indent=2))
+                      all_posts.extend(new)
+                      seen_shortcodes.update(p.get("shortcode") for p in new)
+                      cursor=j.get("end_cursor")
+                      got_new=True
+                      break
+              if not got_new:
+                  break
+              print("TOTAL_POSTS",len(all_posts),"MEDIA_COUNTS",counts())
 
-              browser.close()
+          items=flatten(all_posts)
+          (DBG/"flattened_media.json").write_text(json.dumps(items,ensure_ascii=False,indent=2))
+          print("TOTAL_ITEMS",len(items),"COUNTS",counts())
+          for x in items:
+              print("ITEM",x["shortcode"],"slide",x["slide"],"video",x["is_video"],"post",x["post_url"],"media",str(x["media_url"])[:250])
 
-          (DBG/"responses.json").write_text(json.dumps(results,ensure_ascii=False,indent=2,default=str))
-          (DBG/"candidates.json").write_text(json.dumps(candidates,ensure_ascii=False,indent=2))
-          (DBG/"resolved_pages.json").write_text(json.dumps(resolved_pages))
-          print("RESOLVED_PAGES",resolved_pages)
-          print("FINAL",len(pics),len(vids))
-          for p in sorted(OUT.iterdir()): print("FILE",p.name,p.stat().st_size)
-          if len(pics)<3 or len(vids)<3: raise SystemExit("INSUFFICIENT_MEDIA")
+          pics=[]; vids=[]; hashes=set(); manifest=[]
+          # Prefer full media_url, never thumbnails; this keeps photos distinct from video posters.
+          for x in items:
+              if len(pics)>=3 and len(vids)>=3:
+                  break
+              u=x.get("media_url")
+              if not u:
+                  continue
+              want_video=x["is_video"]
+              if want_video and len(vids)>=3: continue
+              if (not want_video) and len(pics)>=3: continue
+              try:
+                  r=s.get(u,timeout=45,headers={"Referer":"https://www.instagram.com/"})
+                  print("MEDIA_GET",x["shortcode"],x["slide"],r.status_code,r.headers.get("content-type"),len(r.content))
+                  if r.status_code>=400 or len(r.content)<10000: continue
+                  b=r.content; ct=(r.headers.get("content-type") or "").lower()
+                  h=hashlib.sha256(b).hexdigest()
+                  if h in hashes: continue
+                  sig_video=("video/" in ct) or (len(b)>12 and b[4:8]==b"ftyp")
+                  sig_image=("image/" in ct) or b[:3]==b"\xff\xd8\xff" or b[:8]==b"\x89PNG\r\n\x1a\n" or (len(b)>12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP")
+                  if want_video and not sig_video:
+                      print("TYPE_MISMATCH_EXPECT_VIDEO",ct); continue
+                  if (not want_video) and not sig_image:
+                      print("TYPE_MISMATCH_EXPECT_IMAGE",ct); continue
+
+                  hashes.add(h)
+                  if want_video:
+                      n=len(vids)+1
+                      p=OUT/f"arcana_events_video_{n}.mp4"
+                      p.write_bytes(b); vids.append(p)
+                      kind="video"
+                  else:
+                      n=len(pics)+1
+                      ext=".webp" if "webp" in ct else (".png" if "png" in ct else ".jpg")
+                      p=OUT/f"arcana_events_photo_{n}{ext}"
+                      p.write_bytes(b); pics.append(p)
+                      kind="photo"
+                  manifest.append({
+                    "file":p.name,"kind":kind,"bytes":len(b),
+                    "shortcode":x["shortcode"],"slide":x["slide"],
+                    "instagram_post":x["post_url"],"sha256":h
+                  })
+                  print("SAVED",p.name,len(b),"FROM",x["post_url"],"SLIDE",x["slide"])
+              except Exception as e:
+                  print("MEDIA_ERR",x["shortcode"],x["slide"],repr(e))
+
+          (OUT/"manifest.json").write_text(json.dumps({
+              "verified_username":returned,
+              "verified_user_id":uid,
+              "files":manifest
+          },ensure_ascii=False,indent=2))
+
+          print("FINAL_COUNTS",len(pics),len(vids))
+          for p in sorted(OUT.iterdir()):
+              print("FINAL_FILE",p.name,p.stat().st_size)
+          if len(pics)!=3 or len(vids)!=3:
+              raise SystemExit(f"INSUFFICIENT_TARGET_MEDIA photos={len(pics)} videos={len(vids)}")
           PY
-      - name: Verify
-        if: success()
+      - name: Verify exact deliverable
         run: |
           file selected/*
-          test "$(find selected -type f -iname '*.mp4' | wc -l)" -eq 3
-          test "$(find selected -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) | wc -l)" -eq 3
+          test "$(find selected -maxdepth 1 -type f -iname '*.mp4' | wc -l)" -eq 3
+          test "$(find selected -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) | wc -l)" -eq 3
       - name: Upload media
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arcana-events-media
+          name: arcana-events-media-verified
           path: selected/
           if-no-files-found: warn
           retention-days: 1
@@ -246,7 +201,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: arcana-relay-debug
+          name: arcana-tracygram-debug
           path: debug/
           if-no-files-found: warn
           retention-days: 1
