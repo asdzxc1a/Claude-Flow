@@ -1,41 +1,52 @@
-name: Inspect public viewer resolver
+name: Probe RSSHub Instagram relays
 on:
   push:
     branches: ["main"]
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -q requests
-      - name: Probe Picuki worker API
+      - name: Probe routes
         shell: bash
         run: |
           python - <<'PY'
-          import json, requests
-          s=requests.Session()
-          s.headers.update({
-            "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
-            "Accept":"application/json, text/plain, */*",
-            "Origin":"https://picuki.site",
-            "Referer":"https://picuki.site/",
-          })
-          root="https://api-wh.picuki.site/api/v1/instagram"
-          tests=[
-            ("profile",{"username":"arcana_events"}),
-            ("userInfo",{"username":"arcana_events"}),
-            ("postsV2",{"username":"arcana_events","maxId":""}),
-            ("posts",{"username":"arcana_events","maxId":""}),
-            ("usernameSuggestions",{"query":"arcana_events"}),
+          import requests,re
+          bases=[
+            "https://rss.kael.ink",
+            "https://rsshub.app",
+            "https://rss.shab.fun",
+            "http://rsshub.rssforever.com",
+            "http://rss.probe.earth:1200",
+            "https://rsshub.pseudoyu.com",
+            "https://yangzhi.app",
+            "https://rss.peachyjoy.top",
           ]
-          for ep,body in tests:
-            try:
-              r=s.post(f"{root}/{ep}",json=body,timeout=30)
-              print("ENDPOINT",ep,"STATUS",r.status_code,"CT",r.headers.get("content-type"),"LEN",len(r.content))
-              print("HEAD",r.text[:12000])
-            except Exception as e:
-              print("ERR",ep,repr(e))
+          paths=[
+            "/instagram/2/user/arcana_events",
+            "/instagram/user/arcana_events",
+            "/picuki/profile/arcana_events",
+          ]
+          h={"User-Agent":"Mozilla/5.0 (compatible; RSS reader; +https://github.com/DIYgod/RSSHub)","Accept":"application/rss+xml,application/xml,text/xml,text/html,*/*"}
+          for base in bases:
+            for path in paths:
+              u=base+path
+              try:
+                r=requests.get(u,headers=h,timeout=25,allow_redirects=True)
+                txt=r.text
+                print("\n=== RESULT ===")
+                print("URL",u)
+                print("FINAL",r.url)
+                print("STATUS",r.status_code,"CT",r.headers.get("content-type"),"LEN",len(r.content))
+                print("HEAD",re.sub(r"\s+"," ",txt[:5000]))
+                media=re.findall(r'https?://[^"\'<>\s]+',txt)
+                media=[x.replace("&amp;","&") for x in media if any(k in x.lower() for k in [".jpg",".jpeg",".webp",".png",".mp4","cdninstagram","fbcdn","scontent"])]
+                print("MEDIA_COUNT",len(media))
+                for x in media[:20]: print("MEDIA",x[:1000])
+              except Exception as e:
+                print("\n=== ERROR ===",u,repr(e))
           PY
