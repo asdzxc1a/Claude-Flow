@@ -1,0 +1,74 @@
+name: Inspect public viewer resolver
+on:
+  push:
+    branches: ["main"]
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q requests beautifulsoup4
+      - name: Inspect Picuki resolver
+        shell: bash
+        run: |
+          timeout 150s python - <<'PY'
+          import re, json, html, requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin
+          base="https://picuki.site/instagram-profile-viewer"
+          s=requests.Session()
+          s.headers.update({"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36","Accept-Language":"en-US,en;q=0.9"})
+          r=s.get(base,timeout=20)
+          print("GET",r.status_code,r.url,len(r.text),r.headers.get("content-type"))
+          soup=BeautifulSoup(r.text,"html.parser")
+          forms=soup.find_all("form")
+          print("FORMS",len(forms))
+          for i,f in enumerate(forms):
+              print("FORM",i,"action",f.get("action"),"method",f.get("method"),"id",f.get("id"),"class",f.get("class"))
+              print("HTML",str(f)[:5000])
+              inputs=f.find_all(["input","button"])
+              print("FIELDS",[(x.name,x.get("name"),x.get("type"),x.get("value"),x.get("id"),x.get("class")) for x in inputs])
+              vals={}
+              for x in f.find_all("input"):
+                  n=x.get("name")
+                  if not n: continue
+                  typ=(x.get("type") or "text").lower()
+                  if typ in ("hidden",): vals[n]=x.get("value","")
+                  elif typ not in ("submit","button","checkbox","radio","file"): vals[n]="arcana_events"
+              if vals:
+                  url=urljoin(r.url,f.get("action") or r.url)
+                  try:
+                      if (f.get("method") or "get").lower()=="post":
+                          rr=s.post(url,data=vals,timeout=30,allow_redirects=True)
+                      else:
+                          rr=s.get(url,params=vals,timeout=30,allow_redirects=True)
+                      print("SUBMIT",i,rr.status_code,rr.url,len(rr.text),rr.headers.get("content-type"))
+                      print("SUBMIT_HEAD",re.sub(r"\s+"," ",rr.text[:3000]))
+                      open(f"/tmp/submit{i}.html","w").write(rr.text)
+                  except Exception as e: print("SUBMIT_ERR",i,repr(e))
+
+          scripts=[]
+          for sc in soup.find_all("script"):
+              if sc.get("src"): scripts.append(urljoin(r.url,sc["src"]))
+              elif sc.string: scripts.append(("inline",sc.string))
+          print("SCRIPTS",len(scripts))
+          for item in scripts:
+              try:
+                  if isinstance(item,tuple): name,txt=item
+                  else:
+                      name=item; sr=s.get(item,timeout=20); txt=sr.text
+                  hits=[line.strip() for line in txt.splitlines() if re.search(r"fetch\(|axios|XMLHttpRequest|/api/|profile|search|instagram",line,re.I)]
+                  if hits:
+                      print("SCRIPT",name,"len",len(txt),"HITS",len(hits))
+                      for h in hits[:60]: print("JS",h[:1500])
+              except Exception as e: print("SCRIPT_ERR",item,repr(e))
+
+          # Enumerate likely endpoints and assets from raw HTML/JS.
+          for pat in [r'https?://[^"\'<> ]+', r'["\'](/[^"\']*(?:api|search|profile)[^"\']*)["\']']:
+              found=re.findall(pat,r.text,re.I)
+              print("PATTERN",pat,"COUNT",len(found))
+              for x in found[:100]: print("URLISH",html.unescape(x)[:1000])
+          PY
